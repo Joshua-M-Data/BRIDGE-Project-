@@ -5,7 +5,7 @@ Reproducible code for the manuscript:
 **Predictors of Infusion Visit Adherence in the AMP Trials: A Secondary Analysis of HVTN 704/HPTN 085 and HVTN 703/HPTN 081**
 
 ## Repository
-GitHub: `https://github.com/Joshua-M-Data/Predictors-of-Infusion-Visit-Adherence-in-the-AMP-Trials`
+GitHub: `https://github.com/Joshua-M-Data/BRIDGE-Project-`
 
 ## Analysis Files
 
@@ -138,5 +138,5 @@ If your run is aligned with the current manuscript partition, you should see:
 ## Suggested Citation Text (Code Availability)
 
 Reproducible analysis code for this study is publicly available at:  
-`https://github.com/Joshua-M-Data/Predictors-of-Infusion-Visit-Adherence-in-the-AMP-Trials`  
+`https://github.com/Joshua-M-Data/BRIDGE-Project-`  
 The analyses use publicly available AMP datasets (`subject_master.csv`, `retention.csv`, `reacto.csv`).
