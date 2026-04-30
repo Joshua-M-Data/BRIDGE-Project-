@@ -1,0 +1,739 @@
+---
+title: "AMP Manuscript-Only Analysis"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+date: "2026-04-30"
+---
+
+<!--
+Manuscript-only partition file:
+Includes only figures/tables and analytic findings used in the manuscript.
+Exploratory-only chunks are omitted.
+-->
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, echo = TRUE)
+
+pkgs <- c(
+  "data.table", "dplyr", "tidyr", "ggplot2", "scales",
+  "broom", "broom.mixed", "lme4", "knitr", "xtable"
+)
+missing_pkgs <- setdiff(pkgs, rownames(installed.packages()))
+if (length(missing_pkgs)) {
+  stop(paste0("Missing required packages: ", paste(missing_pkgs, collapse = ", ")))
+}
+
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(broom)
+library(broom.mixed)
+library(lme4)
+library(knitr)
+library(xtable)
+
+fit_mixed_logit <- function(formula, data) {
+  fit_primary <- try(
+    glmer(
+      formula,
+      data = data,
+      family = binomial(),
+      nAGQ = 0,
+      control = glmerControl(
+        optimizer = "nloptwrap",
+        calc.derivs = FALSE,
+        optCtrl = list(maxeval = 1e5)
+      )
+    ),
+    silent = TRUE
+  )
+  if (!inherits(fit_primary, "try-error")) return(fit_primary)
+
+  fit_fallback <- try(
+    glmer(
+      formula,
+      data = data,
+      family = binomial(),
+      nAGQ = 0,
+      control = glmerControl(
+        optimizer = "bobyqa",
+        calc.derivs = FALSE,
+        optCtrl = list(maxfun = 1e5)
+      )
+    ),
+    silent = TRUE
+  )
+  if (!inherits(fit_fallback, "try-error")) return(fit_fallback)
+
+  stop("Mixed-effects logistic regression failed with both optimizers.")
+}
+
+tidy_mixed_or <- function(model) {
+  as.data.table(broom.mixed::tidy(
+    model,
+    effects = "fixed",
+    conf.int = TRUE,
+    conf.method = "Wald",
+    exponentiate = TRUE
+  ))
+}
+
+resolve_data_file <- function(filename) {
+  candidates <- c(
+    file.path(getwd(), filename),
+    file.path('/Users/joshuamartin/Desktop/untitled folder', filename)
+  )
+  existing <- candidates[file.exists(candidates)]
+  if (length(existing) == 0) {
+    stop(paste0('Could not locate ', filename, '.'))
+  }
+  normalizePath(existing[1], winslash = '/', mustWork = TRUE)
+}
+
+retention_file <- resolve_data_file('retention.csv')
+reacto_file <- resolve_data_file('reacto.csv')
+subject_master_file <- resolve_data_file('subject_master.csv')
+
+age_bin_breaks <- c(-Inf, 18, 26, 34, 42, 51, Inf)
+age_bin_levels <- c("<18", "18-25", "26-33", "34-41", "42-50", ">50")
+age_palette <- c(
+  "18-25" = "#F06A61",
+  "26-33" = "#79A83B",
+  "34-41" = "#43B9C6",
+  "42-50" = "#B784E3"
+)
+```
+
+# Data Setup
+
+```{r load-and-cohort, message=FALSE, warning=FALSE}
+dt_retention <- fread(retention_file)
+dt_reacto <- fread(reacto_file)
+subject_master <- fread(subject_master_file)
+
+merged_data <- merge(dt_retention, subject_master, by = c("protocol", "uid"), all.x = TRUE)
+
+infusion_labels <- c(
+  "Enrollment/Infusion 1",
+  "Week 8/Infusion 2",
+  "Week 16/Infusion 3",
+  "Week 24/Infusion 4",
+  "Week 32/Infusion 5",
+  "Week 40/Infusion 6",
+  "Week 48/Infusion 7",
+  "Week 56/Infusion 8",
+  "Week 64/Infusion 9",
+  "Week 72/Infusion 10"
+)
+
+infusions_all <- merged_data[visitlabel %in% infusion_labels]
+infusions_all[, visitday_num := suppressWarnings(as.numeric(visitday))]
+infusions_all[, discday_num := suppressWarnings(as.numeric(discday))]
+infusions_all[, post_discontinuation_row := !is.na(discday_num) & !is.na(visitday_num) & visitday_num > discday_num]
+infusions_only <- infusions_all[post_discontinuation_row == FALSE]
+
+infusions_only[, infusion_num := as.integer(gsub(".*Infusion ([0-9]+)", "\\1", visitlabel))]
+infusions_only[, participant_id := interaction(protocol, uid, drop = TRUE)]
+
+infusions_only[, infusion_outcome := fifelse(
+  attn == "Y" & recv == "Y", "Arrived + Infused",
+  fifelse(attn == "Y" & recv == "N", "Arrived + Not Infused",
+          fifelse(attn == "N" & recv == "N", "Did Not Arrive + Not Infused", NA_character_))
+)]
+infusions_only[, missed_infusion_core := fifelse(infusion_outcome == "Arrived + Infused", 0L, 1L)]
+infusions_only[, age_bin := cut(
+  age,
+  breaks = age_bin_breaks,
+  labels = age_bin_levels,
+  right = FALSE,
+  include.lowest = TRUE,
+  ordered_result = TRUE
+)]
+
+impact_summary <- data.table(
+  dataset = c("Raw scheduled infusion rows", "Primary analytic infusion rows"),
+  rows = c(nrow(infusions_all), nrow(infusions_only)),
+  missed = c(
+    sum(fifelse(infusions_all$attn == "Y" & infusions_all$recv == "Y", 0L, 1L), na.rm = TRUE),
+    sum(infusions_only$missed_infusion_core, na.rm = TRUE)
+  )
+)
+impact_summary[, missed_pct := round(100 * missed / rows, 4)]
+kable(impact_summary, caption = "Cohort Denominator Summary")
+```
+
+# Table 1: Primary OR Table
+
+```{r table1-primary, message=FALSE, results='asis'}
+logit_data <- infusions_only[
+  !age_bin %in% c("<18", ">50") & !is.na(age_bin) & !is.na(sex) & !is.na(country) & !is.na(rx_code),
+  .(missed = as.integer(missed_infusion_core), age_bin, sex, country, rx_code, infusion_num, participant_id)
+]
+
+logit_data[, age_bin := factor(as.character(age_bin), levels = c("18-25", "26-33", "34-41", "42-50"))]
+logit_data[, rx_code := stats::relevel(factor(rx_code), ref = "C3")]
+logit_data[, sex := factor(sex)]
+if ("Female" %in% levels(logit_data$sex)) logit_data[, sex := stats::relevel(sex, ref = "Female")]
+country_ref_visit <- if ("United States" %in% unique(logit_data$country)) "United States" else names(sort(table(logit_data$country), decreasing = TRUE))[1]
+logit_data[, country := stats::relevel(factor(country), ref = country_ref_visit)]
+logit_data[, infusion_num_f := factor(infusion_num)]
+
+logit_model <- fit_mixed_logit(
+  missed ~ age_bin + sex + country + rx_code + infusion_num_f + (1 | participant_id),
+  data = logit_data
+)
+
+logit_tidy <- tidy_mixed_or(logit_model)[, .(term, estimate, conf.low, conf.high, p.value)]
+
+counts <- rbindlist(list(
+  logit_data[, .(
+    Group = "Age Group",
+    Level = as.character(age_bin),
+    Total_Scheduled_Visits = .N,
+    Missed = sum(missed),
+    term = fifelse(as.character(age_bin) == "18-25", NA_character_, paste0("age_bin", as.character(age_bin)))
+  ), by = age_bin],
+  logit_data[, .(
+    Group = "Sex",
+    Level = as.character(sex),
+    Total_Scheduled_Visits = .N,
+    Missed = sum(missed),
+    term = fifelse(as.character(sex) == if ("Female" %in% levels(logit_data$sex)) "Female" else levels(logit_data$sex)[1], NA_character_, paste0("sex", as.character(sex)))
+  ), by = sex],
+  logit_data[, .(
+    Group = "Treatment Arm",
+    Level = as.character(rx_code),
+    Total_Scheduled_Visits = .N,
+    Missed = sum(missed),
+    term = fifelse(as.character(rx_code) == "C3", NA_character_, paste0("rx_code", as.character(rx_code)))
+  ), by = rx_code],
+  logit_data[, .(
+    Group = "Country",
+    Level = as.character(country),
+    Total_Scheduled_Visits = .N,
+    Missed = sum(missed),
+    term = fifelse(as.character(country) == country_ref_visit, NA_character_, paste0("country", as.character(country)))
+  ), by = country]
+), fill = TRUE)
+
+counts <- unique(counts)
+counts[, Infused := Total_Scheduled_Visits - Missed]
+counts[, Infused_Visits := sprintf("%s (%.1f%%)", format(Infused, big.mark = ","), 100 * Infused / Total_Scheduled_Visits)]
+counts[, Missed_Visits := sprintf("%s (%.1f%%)", format(Missed, big.mark = ","), 100 * Missed / Total_Scheduled_Visits)]
+
+out <- merge(counts, logit_tidy, by = "term", all.x = TRUE, sort = FALSE)
+out[, OR_95CI := fifelse(is.na(term), "Reference", sprintf("%.2f (%.2f--%.2f)", estimate, conf.low, conf.high))]
+out[, P_value := fifelse(is.na(term), "---", format.pval(p.value, digits = 3, eps = 0.001))]
+
+out[, group_order := match(Group, c("Age Group", "Sex", "Treatment Arm", "Country"))]
+out[Group == "Age Group", level_order := match(Level, c("18-25", "26-33", "34-41", "42-50"))]
+out[Group == "Sex", level_order := match(Level, c("Female", "Male"))]
+out[Group == "Treatment Arm", level_order := match(Level, c("C3", "T1", "T2"))]
+out[Group == "Country", level_order := match(Level, c("Botswana", "Kenya", "Malawi", "Mozambique", "South Africa", "Tanzania", "Zimbabwe", "Brazil", "Peru", "Switzerland", "United States"))]
+setorder(out, group_order, level_order, Level)
+
+out_show <- out[, .(Group, Level, Total_Scheduled_Visits, Infused_Visits, Missed_Visits, OR_95CI, P_value)]
+
+xt <- xtable(out_show, align = c("l", "l", "l", "r", "l", "l", "l", "l"))
+print(xt, include.rownames = FALSE, floating = TRUE, table.placement = "ht", hline.after = c(-1, 0, nrow(out_show)))
+```
+
+# Figure 1: Stacked Outcomes by Infusion Number
+
+```{r fig1-stacked, message=FALSE, warning=FALSE, fig.cap="Figure 1. Infusion visit outcomes by infusion number (visit-level).", fig.width=11, fig.height=7}
+plot_data <- infusions_only[, .(
+  Arrived_Infused = sum(infusion_outcome == "Arrived + Infused", na.rm = TRUE),
+  Missed = sum(missed_infusion_core == 1L, na.rm = TRUE)
+), by = infusion_num][order(infusion_num)]
+
+plot_long <- melt(plot_data, id.vars = "infusion_num", variable.name = "Outcome", value.name = "Count")
+if (!is.data.table(plot_long)) {
+  setDT(plot_long)
+}
+plot_long[, Outcome := factor(
+  Outcome,
+  levels = c("Missed", "Arrived_Infused"),
+  labels = c("Missed", "Arrived + Infused")
+)]
+
+ggplot(plot_long, aes(x = factor(infusion_num), y = Count, fill = Outcome)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("Arrived + Infused" = "#F05C59", "Missed" = "#2AA9B0")) +
+  labs(
+    title = "Infusion Visit Outcomes by Infusion Number (Visit-Level)",
+    x = "Infusion Number",
+    y = "Number of Scheduled Infusion Visits",
+    fill = "Outcome"
+  ) +
+  theme_minimal(base_size = 16)
+```
+
+# Figure 2: Missed Trends Over Time by Age Group
+
+```{r fig2-age-trend, message=FALSE, warning=FALSE, fig.width=11, fig.height=7}
+missed_by_infusion_age <- infusions_only[
+  !age_bin %in% c("<18", ">50"),
+  .(
+    total = .N,
+    missed = sum(missed_infusion_core == 1L, na.rm = TRUE),
+    missed_pct = mean(missed_infusion_core == 1L, na.rm = TRUE)
+  ), by = .(infusion_num, age_bin)
+][order(infusion_num, age_bin)]
+
+missed_by_infusion_age[, ci_upper := mapply(function(miss, tot) binom.test(miss, tot)$conf.int[2], missed, total)]
+missed_by_infusion_age[, ci_lower := mapply(function(miss, tot) binom.test(miss, tot)$conf.int[1], missed, total)]
+
+p <- ggplot(missed_by_infusion_age, aes(x = infusion_num, y = missed_pct, color = age_bin, group = age_bin)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper, fill = age_bin), alpha = 0.2, color = NA) +
+  scale_color_manual(values = age_palette, breaks = names(age_palette)) +
+  scale_fill_manual(values = age_palette, breaks = names(age_palette)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title = "Missed Infusion Trends Over Time by Age Group (18-50)",
+    x = "Infusion Number",
+    y = "Missed Infusion Rate",
+    color = "Age Group",
+    fill = "Age Group"
+  ) +
+  theme_minimal(base_size = 16)
+print(p)
+```
+
+# Figure 3: Secondary Participant-Level Predicted Probability by Age
+
+```{r fig3-secondary-age, message=FALSE, warning=FALSE, fig.width=11, fig.height=7}
+missed_counts <- infusions_only[, .(
+  missed = sum(missed_infusion_core == 1L, na.rm = TRUE),
+  total_infusions = .N
+), by = .(protocol, uid)]
+missed_counts[, missed2plus := as.integer(missed >= 2)]
+
+part_model_data <- merge(
+  missed_counts,
+  subject_master[, .(protocol, uid, age, sex, country, rx_code)],
+  by = c("protocol", "uid"),
+  all.x = TRUE
+)
+part_model_data <- part_model_data[complete.cases(part_model_data[, .(missed2plus, age, sex, country, rx_code, total_infusions)])]
+part_model_data[, rx_code := stats::relevel(factor(rx_code), ref = "C3")]
+part_model_data[, sex := factor(sex)]
+if ("Female" %in% levels(part_model_data$sex)) part_model_data[, sex := stats::relevel(sex, ref = "Female")]
+country_ref_part <- if ("United States" %in% unique(part_model_data$country)) "United States" else names(sort(table(part_model_data$country), decreasing = TRUE))[1]
+part_model_data[, country := stats::relevel(factor(country), ref = country_ref_part)]
+
+logit_2plus <- glm(missed2plus ~ age + sex + country + rx_code + total_infusions, data = part_model_data, family = binomial())
+
+age_pred <- data.table(age = seq(18, 50, by = 0.5))
+age_pred[, sex := if ("Female" %in% levels(part_model_data$sex)) "Female" else levels(part_model_data$sex)[1]]
+age_pred[, country := country_ref_part]
+age_pred[, rx_code := "C3"]
+age_pred[, total_infusions := median(part_model_data$total_infusions, na.rm = TRUE)]
+age_pred[, pred := predict(logit_2plus, newdata = age_pred, type = "response")]
+
+ggplot(age_pred, aes(x = age, y = pred)) +
+  geom_line(color = "#E36414", linewidth = 1.3) +
+  labs(
+    title = "Predicted probability of having >=2 missed infusions by age",
+    x = "Age",
+    y = "Predicted probability (>=2 missed infusions)"
+  ) +
+  theme_minimal(base_size = 16)
+```
+
+# Figure 4: Missed Proportion by Treatment Arm and Age Group
+
+```{r fig4-arm-age, message=FALSE, warning=FALSE, fig.width=11, fig.height=7}
+missed_by_arm_age <- infusions_only[
+  !age_bin %in% c("<18", ">50"),
+  .(
+    total = .N,
+    missed = sum(missed_infusion_core == 1L, na.rm = TRUE),
+    missed_rate = mean(missed_infusion_core == 1L, na.rm = TRUE)
+  ), by = .(rx_code, age_bin)
+]
+
+missed_by_arm_age[, ci_upper := mapply(function(miss, tot) binom.test(miss, tot)$conf.int[2], missed, total)]
+missed_by_arm_age[, ci_lower := mapply(function(miss, tot) binom.test(miss, tot)$conf.int[1], missed, total)]
+
+p <- ggplot(missed_by_arm_age, aes(x = age_bin, y = missed_rate, fill = rx_code)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), position = position_dodge(width = 0.8), width = 0.2) +
+  scale_fill_manual(values = c("C3" = "#F06A61", "T1" = "#00BA38", "T2" = "#619CFF"), name = "Treatment Arm") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Proportion of Missed Infusions by Treatment Arm and Age Group",
+    x = "Age Group",
+    y = "Proportion Missed"
+  ) +
+  theme_minimal(base_size = 16)
+print(p)
+```
+
+# Supplementary Figure S2: Missed Rate by Infusion Number
+
+```{r supp-fig-missed-by-infnum, message=FALSE, warning=FALSE, fig.width=11, fig.height=7}
+missed_by_infusion <- infusions_only[, .(
+  total = .N,
+  missed = sum(missed_infusion_core == 1L, na.rm = TRUE),
+  missed_pct = mean(missed_infusion_core == 1L, na.rm = TRUE)
+), by = infusion_num][order(infusion_num)]
+
+ggplot(missed_by_infusion, aes(x = factor(infusion_num), y = missed_pct)) +
+  geom_bar(stat = "identity", fill = "#1675B6", width = 0.7) +
+  geom_text(aes(label = missed), vjust = -0.3, size = 5) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Missed Infusion Rate by Infusion Number",
+    x = "Infusion Number",
+    y = "Missed Infusion Rate",
+    caption = "Number above each bar = missed infusions"
+  ) +
+  theme_minimal(base_size = 16)
+```
+
+# Supplementary Table S1: Early Termination Reasons
+
+```{r supp-table-early-term, message=FALSE, warning=FALSE}
+early_term_reason_table <- subject_master[
+  !is.na(earlytmreas) & trimws(as.character(earlytmreas)) != "",
+  .N,
+  by = earlytmreas
+][order(-N)]
+early_term_reason_table[, percent := round(100 * N / sum(N), 1)]
+
+kable(
+  early_term_reason_table,
+  col.names = c("Early Termination Reason", "Count", "Percent (%)"),
+  caption = "Supplementary Table S1. Overall Early Termination Reasons"
+)
+```
+
+# Supplementary Table S2 and Supplementary Figure S1: Pooled Arm by Age
+
+```{r supp-pooled-arm-age, message=FALSE, warning=FALSE, fig.width=11, fig.height=7}
+infusions_only[, pooled_arm := ifelse(rx_code %in% c("T1", "T2"), "T1+T2", as.character(rx_code))]
+
+missed_by_pooled_arm_age <- infusions_only[
+  !age_bin %in% c("<18", ">50"),
+  .(
+    total = .N,
+    missed = sum(missed_infusion_core == 1L, na.rm = TRUE),
+    missed_rate = mean(missed_infusion_core == 1L, na.rm = TRUE)
+  ), by = .(pooled_arm, age_bin)
+][order(pooled_arm, age_bin)]
+
+missed_by_pooled_arm_age[, percent_missed := round(100 * missed_rate, 1)]
+
+supp_s2 <- missed_by_pooled_arm_age[, .(
+  rx_pooled = fifelse(pooled_arm == "T1+T2", "Active (T1/T2)", "Control (C3)"),
+  age_band = as.character(age_bin),
+  missed_infusions = missed,
+  total_infusions = total,
+  percent_missed = percent_missed
+)]
+
+kable(supp_s2, caption = "Supplementary Table S2. Missed infusion visits by pooled treatment arm and age band (descriptive)")
+
+missed_by_pooled_arm_age[, ci_upper := mapply(function(miss, tot) binom.test(miss, tot)$conf.int[2], missed, total)]
+missed_by_pooled_arm_age[, ci_lower := mapply(function(miss, tot) binom.test(miss, tot)$conf.int[1], missed, total)]
+
+p <- ggplot(missed_by_pooled_arm_age, aes(x = pooled_arm, y = missed_rate, fill = age_bin)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), position = position_dodge(width = 0.8), width = 0.2) +
+  scale_fill_manual(values = age_palette, breaks = names(age_palette)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Proportion of Missed Infusions by Pooled Treatment Arm and Age Group",
+    x = "Pooled Treatment Arm",
+    y = "Missed Infusion Rate",
+    fill = "Age Group"
+  ) +
+  theme_minimal(base_size = 16)
+print(p)
+```
+
+# Supplementary Figure S3: AE Symptom Frequency Heatmap
+
+```{r supp-ae-heatmap, message=FALSE, warning=FALSE, fig.width=11, fig.height=7}
+ae_filtered <- dt_reacto[!rgsevmaxc %in% c("None", "None or Not gradable")]
+
+symptom_names <- c(
+  "Pain", "Tenderness", "Pain and/or Tenderness",
+  "Erythema", "Induration", "Erythema and/or Induration",
+  "Headache", "Malaise/fatigue", "Myalgia", "Nausea", "Arthralgia", "Chills", "Vomiting", "Temperature (C)",
+  "Local Symptoms", "Systemic Symptoms"
+)
+
+ae_plot <- ae_filtered[
+  rgparamc %in% symptom_names,
+  .(participants = uniqueN(uid)),
+  by = .(visitno, rgtype, rgparamc)
+]
+
+n_total <- uniqueN(infusions_only[, .(protocol, uid)])
+ae_plot[, pct := 100 * participants / n_total]
+ae_plot[, rgtype := factor(tolower(rgtype), levels = c("local", "systemic"))]
+
+symptom_order <- ae_plot[, .(overall = mean(pct, na.rm = TRUE)), by = rgparamc][order(-overall)]
+ae_plot[, rgparamc := factor(rgparamc, levels = symptom_order$rgparamc)]
+
+ggplot(ae_plot, aes(x = factor(visitno), y = rgparamc, fill = pct)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  facet_grid(rgtype ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_viridis_c(option = "plasma", name = "Percent of Participants") +
+  labs(
+    title = "Symptom Frequency by Visit Number and AE Type",
+    x = "Visit Number",
+    y = "Symptom (sorted by overall frequency)"
+  ) +
+  theme_minimal(base_size = 16)
+```
+
+# Key Manuscript Findings Tables
+
+```{r key-findings, message=FALSE, warning=FALSE}
+# Protocol-level descriptive missed rates (used in Results text)
+protocol_missed <- infusions_only[, .(
+  total = .N,
+  missed = sum(missed_infusion_core == 1L, na.rm = TRUE),
+  missed_rate_pct = round(100 * mean(missed_infusion_core == 1L, na.rm = TRUE), 2)
+), by = protocol][order(protocol)]
+
+# Secondary participant-level model terms used in text
+logit_2plus_tidy <- as.data.table(broom::tidy(logit_2plus, conf.int = TRUE, exponentiate = TRUE))
+secondary_terms <- logit_2plus_tidy[term %in% c("age", "total_infusions"), .(
+  term, estimate, conf.low, conf.high, p.value
+)]
+
+# Participant-level descriptive missed-count comparisons used in Results text
+missed_counts_desc <- infusions_only[, .(
+  missed = sum(missed_infusion_core == 1L, na.rm = TRUE)
+), by = .(protocol, uid)]
+missed_counts_desc <- merge(
+  missed_counts_desc,
+  subject_master[, .(protocol, uid, rx_code)],
+  by = c("protocol", "uid"),
+  all.x = TRUE
+)
+
+missed_dist_by_arm <- missed_counts_desc[, .(
+  Median_Missed = as.numeric(median(missed, na.rm = TRUE)),
+  IQR_Missed = as.numeric(IQR(missed, na.rm = TRUE))
+), by = rx_code][order(rx_code)]
+
+kruskal_missed_by_arm <- kruskal.test(missed ~ rx_code, data = missed_counts_desc)
+kruskal_summary <- data.table(
+  Comparison = "Participant-level missed infusion count by treatment arm",
+  P_value = kruskal_missed_by_arm$p.value
+)
+
+# Pooled-arm by age interaction test (visit-level mixed model)
+if (!"pooled_arm" %in% names(infusions_only)) {
+  infusions_only[, pooled_arm := ifelse(rx_code %in% c("T1", "T2"), "T1+T2", as.character(rx_code))]
+}
+
+logit_interaction_data <- infusions_only[
+  !age_bin %in% c("<18", ">50") & pooled_arm %in% c("T1+T2", "C3") &
+    !is.na(age_bin) & !is.na(sex) & !is.na(country) & !is.na(pooled_arm),
+  .(
+    missed = as.integer(missed_infusion_core),
+    age_bin, sex, country, pooled_arm, infusion_num, participant_id
+  )
+]
+
+logit_interaction_data[, age_bin := factor(as.character(age_bin), levels = c("18-25", "26-33", "34-41", "42-50"))]
+logit_interaction_data[, pooled_arm := stats::relevel(factor(pooled_arm), ref = "C3")]
+country_ref_interaction <- if ("United States" %in% unique(logit_interaction_data$country)) {
+  "United States"
+} else {
+  names(sort(table(logit_interaction_data$country), decreasing = TRUE))[1]
+}
+logit_interaction_data[, country := stats::relevel(factor(country), ref = country_ref_interaction)]
+logit_interaction_data[, sex := factor(sex)]
+if ("Female" %in% levels(logit_interaction_data$sex)) {
+  logit_interaction_data[, sex := stats::relevel(sex, ref = "Female")]
+}
+logit_interaction_data[, infusion_num_f := factor(infusion_num)]
+
+logit_interaction_reduced <- fit_mixed_logit(
+  missed ~ pooled_arm + age_bin + sex + country + infusion_num_f + (1 | participant_id),
+  data = logit_interaction_data
+)
+logit_interaction_full <- fit_mixed_logit(
+  missed ~ pooled_arm * age_bin + sex + country + infusion_num_f + (1 | participant_id),
+  data = logit_interaction_data
+)
+interaction_lrt <- as.data.table(anova(logit_interaction_reduced, logit_interaction_full, test = "Chisq"))
+df_col <- if ("Chi Df" %in% names(interaction_lrt)) "Chi Df" else if ("Df" %in% names(interaction_lrt)) "Df" else NA_character_
+p_col <- if ("Pr(>Chisq)" %in% names(interaction_lrt)) "Pr(>Chisq)" else NA_character_
+interaction_global <- data.table(
+  Test = "Global pooled-arm x age interaction (LRT)",
+  Chisq = interaction_lrt[2, Chisq],
+  Df = if (!is.na(df_col)) interaction_lrt[2, get(df_col)] else NA_real_,
+  P_value = if (!is.na(p_col)) interaction_lrt[2, get(p_col)] else NA_real_
+)
+interaction_terms <- tidy_mixed_or(logit_interaction_full)[grepl("^pooled_armT1\\+T2:age_bin", term),
+  .(term, estimate, conf.low, conf.high, p.value)
+]
+
+# Age 26-33 subgroup tests (used in manuscript text)
+subset_26_33 <- infusions_only[age_bin == "26-33"]
+subset_26_33_participant <- subset_26_33[
+  ,
+  .(any_missed = as.integer(any(missed_infusion_core == 1L, na.rm = TRUE))),
+  by = .(protocol, uid, rx_code)
+]
+tab_26_33 <- table(subset_26_33_participant$rx_code, subset_26_33_participant$any_missed)
+if (all(tab_26_33 >= 5)) {
+  test_26_33 <- chisq.test(tab_26_33)
+  test_26_33_name <- "Chi-squared"
+} else {
+  test_26_33 <- fisher.test(tab_26_33)
+  test_26_33_name <- "Fisher's exact"
+}
+test_26_33_summary <- data.table(
+  Test = paste0("Participant-level ", test_26_33_name, " test in age 26-33"),
+  P_value = test_26_33$p.value
+)
+
+subset_26_33[, missed := as.integer(missed_infusion_core)]
+subset_26_33[, participant_id := interaction(protocol, uid, drop = TRUE)]
+subset_26_33[, rx_code := stats::relevel(factor(rx_code), ref = "C3")]
+subset_26_33[, sex := factor(sex)]
+if ("Female" %in% levels(subset_26_33$sex)) {
+  subset_26_33[, sex := stats::relevel(sex, ref = "Female")]
+}
+country_ref_26 <- if ("United States" %in% unique(subset_26_33$country)) {
+  "United States"
+} else {
+  names(sort(table(subset_26_33$country), decreasing = TRUE))[1]
+}
+subset_26_33[, country := stats::relevel(factor(country), ref = country_ref_26)]
+subset_26_33[, infusion_num_f := factor(infusion_num)]
+
+logit_26_33 <- fit_mixed_logit(
+  missed ~ rx_code + sex + country + infusion_num_f + (1 | participant_id),
+  data = subset_26_33
+)
+logit_26_33_tidy <- tidy_mixed_or(logit_26_33)[term %in% c("rx_codeT1", "rx_codeT2"),
+  .(term, estimate, conf.low, conf.high, p.value)
+]
+
+# AE model (locked sequential AE alignment, matching patched primary script)
+ae_flag_raw <- unique(
+  dt_reacto[
+    !rgsevmaxc %in% c("None", "None or Not gradable"),
+    .(AE_at_visit = 1L),
+    by = .(protocol, uid, visitno)
+  ]
+)
+
+infusion_map <- unique(infusions_only[, .(protocol, uid, infusion_num)])
+setorder(infusion_map, protocol, uid, infusion_num)
+infusion_map[, infusion_seq := seq_len(.N), by = .(protocol, uid)]
+
+ae_visit_map <- unique(dt_reacto[, .(protocol, uid, visitno)])
+setorder(ae_visit_map, protocol, uid, visitno)
+ae_visit_map[, ae_seq := seq_len(.N), by = .(protocol, uid)]
+
+ae_to_infusion <- merge(
+  ae_visit_map[, .(protocol, uid, visitno, ae_seq)],
+  infusion_map[, .(protocol, uid, infusion_num, infusion_seq)],
+  by.x = c("protocol", "uid", "ae_seq"),
+  by.y = c("protocol", "uid", "infusion_seq"),
+  all.x = TRUE
+)
+
+ae_flag <- merge(
+  ae_flag_raw,
+  ae_to_infusion[, .(protocol, uid, visitno, infusion_num)],
+  by = c("protocol", "uid", "visitno"),
+  all.x = TRUE
+)[
+  !is.na(infusion_num),
+  .(AE_at_infusion = as.integer(any(AE_at_visit == 1L))),
+  by = .(protocol, uid, infusion_num)
+]
+
+infusions_ae <- merge(infusions_only, ae_flag, by = c("protocol", "uid", "infusion_num"), all.x = TRUE)
+infusions_ae[is.na(AE_at_infusion), AE_at_infusion := 0L]
+setorder(infusions_ae, protocol, uid, infusion_num)
+infusions_ae[, AE_prior := shift(AE_at_infusion, n = 1, type = "lag"), by = .(protocol, uid)]
+infusions_ae_next <- infusions_ae[!is.na(AE_prior)]
+infusions_ae_next[, missed := as.integer(missed_infusion_core == 1L)]
+
+ae_unadj <- infusions_ae_next[, .(
+  N = .N,
+  missed_rate_pct = round(100 * mean(missed), 2)
+), by = AE_prior][order(AE_prior)]
+
+logit_ae_data <- infusions_ae_next[
+  !age_bin %in% c("<18", ">50") & !is.na(age_bin) & !is.na(sex) & !is.na(country) & !is.na(rx_code),
+  .(missed, AE_prior = as.integer(AE_prior), age_bin, sex, country, rx_code, infusion_num, participant_id)
+]
+
+logit_ae_data[, age_bin := factor(as.character(age_bin), levels = c("18-25", "26-33", "34-41", "42-50"))]
+logit_ae_data[, rx_code := stats::relevel(factor(rx_code), ref = "C3")]
+logit_ae_data[, sex := factor(sex)]
+if ("Female" %in% levels(logit_ae_data$sex)) logit_ae_data[, sex := stats::relevel(sex, ref = "Female")]
+country_ref_ae <- if ("United States" %in% unique(logit_ae_data$country)) "United States" else names(sort(table(logit_ae_data$country), decreasing = TRUE))[1]
+logit_ae_data[, country := stats::relevel(factor(country), ref = country_ref_ae)]
+logit_ae_data[, infusion_num_f := factor(infusion_num)]
+
+logit_ae_model <- fit_mixed_logit(
+  missed ~ AE_prior + age_bin + sex + country + rx_code + infusion_num_f + (1 | participant_id),
+  data = logit_ae_data
+)
+logit_ae_tidy <- tidy_mixed_or(logit_ae_model)
+ae_term <- logit_ae_tidy[term == "AE_prior", .(term, estimate, conf.low, conf.high, p.value)]
+
+kable(protocol_missed, caption = "Protocol-Level Descriptive Missed Rates")
+kable(secondary_terms, caption = "Secondary Participant-Level Model Terms Used in Manuscript Text")
+kable(missed_dist_by_arm, caption = "Median [IQR] Missed Infusions by Treatment Arm")
+kable(kruskal_summary, caption = "Kruskal-Wallis Test for Participant-Level Missed Infusion Counts by Arm")
+kable(interaction_global, caption = "Global Interaction Test: Pooled Arm x Age (Visit-Level Mixed Model)")
+kable(interaction_terms, caption = "Interaction-Term Estimates: Pooled Arm x Age (Visit-Level Mixed Model)")
+kable(as.data.table(tab_26_33, keep.rownames = "rx_code"), caption = "Age 26-33: Participant-Level Any-Missed by Treatment Arm")
+kable(test_26_33_summary, caption = "Age 26-33: Participant-Level Test Summary")
+kable(logit_26_33_tidy, caption = "Age 26-33: Visit-Level Mixed-Effects Treatment Contrasts")
+kable(ae_unadj, col.names = c("AE_prior", "N", "Missed Next Rate (%)"), caption = "Unadjusted Missed-Next Rate by AE_prior")
+kable(ae_term, caption = "AE Model Term Used in Manuscript Text")
+```
+
+# Manuscript Numbers Sync Block
+
+```{r manuscript-sync, message=FALSE, warning=FALSE}
+missed_counts <- infusions_only[, .(missed = sum(missed_infusion_core == 1L, na.rm = TRUE)), by = .(protocol, uid)]
+participant_dist <- missed_counts[, .N, by = .(missed_cat = fifelse(missed == 0, "0 missed", fifelse(missed == 1, "1 missed", "2+ missed")))]
+
+sync <- data.table(
+  item = c(
+    "Raw scheduled infusion rows",
+    "Primary analytic infusion rows",
+    "Primary missed infusions",
+    "Primary attended+infused",
+    "Participants: 0 missed",
+    "Participants: 1 missed",
+    "Participants: 2+ missed"
+  ),
+  value = c(
+    nrow(infusions_all),
+    nrow(infusions_only),
+    sum(infusions_only$missed_infusion_core),
+    sum(infusions_only$missed_infusion_core == 0L),
+    participant_dist[missed_cat == "0 missed", N],
+    participant_dist[missed_cat == "1 missed", N],
+    participant_dist[missed_cat == "2+ missed", N]
+  )
+)
+
+kable(sync, caption = "Manuscript Sync Numbers")
+```
