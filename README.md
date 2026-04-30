@@ -17,8 +17,6 @@ This project is split into two R Markdown workflows:
 2. `Retro_AMP_Project_Exploratory.Rmd`  
    Full exploratory workflow (legacy checks, alternate models, additional diagnostics/plots).
 
-If your local filenames differ (e.g., `Projekt_manuscript_partition.Rmd`, `Project_exploratory.Rmd`), use those equivalents.
-
 ## Recommended Repository Layout
 
 ```text
@@ -49,8 +47,6 @@ Optional reference files:
 ## Software
 
 - R 4.5.x
-- R packages are checked in each script setup chunk (fails fast if missing).
-- For PDF output, a working LaTeX installation is required (`tinytex`/TeX Live).
 
 ## How To Run
 
@@ -74,7 +70,7 @@ Rscript -e "rmarkdown::render('Retro_AMP_Project_Partition.Rmd', output_format='
 Rscript -e "rmarkdown::render('Retro_AMP_Project_Exploratory.Rmd', output_format='html_document')"
 ```
 
-## What Each Workflow Produces
+## Workflow
 
 ### Manuscript partition (`Retro_AMP_Project_Partition.Rmd`)
 - Main manuscript items:
@@ -93,11 +89,9 @@ Rscript -e "rmarkdown::render('Retro_AMP_Project_Exploratory.Rmd', output_format
   - pooled arm x age interaction test
   - age 26-33 subgroup tests
   - AE-prior adjusted and unadjusted summaries
-  - denominator sync block
 
 ### Exploratory workflow (`Retro_AMP_Project_Exploratory.Rmd`)
-- Full development history, alternative models, and extra diagnostics.
-- Use this for sensitivity checks and non-manuscript analyses.
+- Full history, alternative models, and extra analyses.
 
 ## Core Definitions Used in Manuscript Workflow
 
@@ -140,31 +134,6 @@ If your run is aligned with the current manuscript partition, you should see:
   - `0 missed`: `3,780`
   - `1 missed`: `386`
   - `2+ missed`: `457`
-
-Small differences can occur if data files differ by release/version.
-
-## Troubleshooting
-
-1. `file does not exist` errors  
-   Ensure CSVs are in the same folder as the Rmd, or update path resolution.
-
-2. `:=` data.table errors after `melt()`  
-   Convert to data.table first: `setDT(obj)`.
-
-3. Mixed-model convergence/optimizer issues  
-   The scripts already include optimizer fallback (`nloptwrap` -> `bobyqa`).
-
-4. Path issues on macOS  
-   Avoid trailing spaces in folder names if possible (can cause confusing path mismatches).
-
-5. PDF render failures  
-   Install/configure LaTeX and rerun.
-
-## Versioning Guidance
-
-- Commit both Rmd files with any manuscript update.
-- Re-render partition output after code edits and sync manuscript text to the new numeric blocks.
-- Tag submission versions (e.g., `v1-manuscript-submit`, `v2-revision`).
 
 ## Suggested Citation Text (Code Availability)
 
