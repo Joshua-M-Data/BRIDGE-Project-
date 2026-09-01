@@ -4,9 +4,6 @@ Reproducible code for the manuscript:
 
 **Predictors of Infusion Visit Adherence in the AMP Trials: A Secondary Analysis of HVTN 704/HPTN 085 and HVTN 703/HPTN 081**
 
-## Repository
-GitHub: `https://github.com/Joshua-M-Data/BRIDGE-Project-`
-
 ## Analysis Files
 
 This project is split into two R Markdown workflows:
@@ -17,20 +14,6 @@ This project is split into two R Markdown workflows:
 2. `Retro_AMP_Project_Exploratory.Rmd`  
    Full exploratory workflow (legacy checks, alternate models, additional diagnostics/plots).
 
-## Recommended Repository Layout
-
-```text
-repo-root/
-  README.md
-  Retro_AMP_Project_Partition.Rmd
-  Retro_AMP_Project_Exploratory.Rmd
-  subject_master.csv
-  retention.csv
-  reacto.csv
-  AMP Primary Data Dictionary.xlsx          (optional, reference)
-  protocol PDFs / manuscript drafts         (optional, reference)
-```
-
 ## Data Inputs
 
 Place these files in the same directory as the Rmd files:
@@ -39,10 +22,7 @@ Place these files in the same directory as the Rmd files:
 - `retention.csv`
 - `reacto.csv`
 
-Optional reference files:
-
-- `AMP Primary Data Dictionary.xlsx`
-- AMP protocol/supporting PDFs
+These datasets are not included in this repository.
 
 ## Software
 
@@ -123,7 +103,7 @@ Rscript -e "rmarkdown::render('Retro_AMP_Project_Exploratory.Rmd', output_format
   - Primary attended+infused and missed counts
 - Country is modeled without protocol in adjusted primary models to avoid nested collinearity.
 
-## Expected Cohort Checkpoints (Current Public Extract)
+## Expected Cohort Checkpoints
 
 If your run is aligned with the current manuscript partition, you should see:
 - Raw scheduled infusion rows: `42,802`
